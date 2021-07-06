@@ -608,7 +608,11 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 }
             }
 
-            context.SetVariable(name, data, isSecret: isSecret, isOutput: isOutput, isReadOnly: isReadOnly);
+            var checker = context.GetHostContext().GetService<ITaskRestrictionsChecker>();
+            if (checker.CheckSettableVariable(context, name))
+            {
+                context.SetVariable(name, data, isSecret: isSecret, isOutput: isOutput, isReadOnly: isReadOnly);
+            }
         }
     }
 
@@ -781,6 +785,12 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         {
             ArgUtil.NotNull(context, nameof(context));
             ArgUtil.NotNull(command, nameof(command));
+
+            var checker = context.GetHostContext().GetService<ITaskRestrictionsChecker>();
+            if (!checker.CheckSettableVariable(context, Constants.PathVariable))
+            {
+                return;
+            }
 
             var data = command.Data;
 

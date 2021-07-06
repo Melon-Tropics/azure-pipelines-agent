@@ -155,26 +155,22 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             var configurationStore = HostContext.GetService<IConfigurationStore>();
             AgentSettings settings = configurationStore.GetSettings();
             Boolean signingEnabled = (settings.SignatureVerification != null && settings.SignatureVerification.Mode != SignatureVerificationMode.None);
+            Boolean alwaysExtractTask = signingEnabled || settings.AlwaysExtractTask;
 
-            if (File.Exists(destDirectory + ".completed") && !signingEnabled)
+            if (File.Exists(destDirectory + ".completed") && !alwaysExtractTask)
             {
                 executionContext.Debug($"Task '{task.Name}' already downloaded at '{destDirectory}'.");
                 return;
             }
 
             String taskZipPath = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.TaskZips), $"{task.Name}_{task.Id}_{task.Version}.zip");
-            if (signingEnabled && File.Exists(taskZipPath))
+            if (alwaysExtractTask && File.Exists(taskZipPath))
             {
                 executionContext.Debug($"Task '{task.Name}' already downloaded at '{taskZipPath}'.");
 
-                // We need to extract the zip now because the task.json metadata for the task is used in JobExtension.InitializeJob.
-                // This is fine because we overwrite the contents at task run time.
-                if (!File.Exists(destDirectory + ".completed"))
-                {
-                    // The zip exists but it hasn't been extracted yet.
-                    IOUtil.DeleteDirectory(destDirectory, executionContext.CancellationToken);
-                    ExtractZip(taskZipPath, destDirectory);
-                }
+                // Extract a new zip every time
+                IOUtil.DeleteDirectory(destDirectory, executionContext.CancellationToken);
+                ExtractZip(taskZipPath, destDirectory);
 
                 return;
             }
@@ -255,7 +251,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                     }
                 }
 
-                if (signingEnabled)
+                if (alwaysExtractTask)
                 {
                     Directory.CreateDirectory(HostContext.GetDirectory(WellKnownDirectory.TaskZips));
 
@@ -330,6 +326,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
 
     public sealed class DefinitionData
     {
+        public DefinitionVersion Version { get; set; }
+        public string Name { get; set; }
         public string FriendlyName { get; set; }
         public string Description { get; set; }
         public string HelpMarkDown { get; set; }
@@ -340,6 +338,14 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
         public ExecutionData PreJobExecution { get; set; }
         public ExecutionData Execution { get; set; }
         public ExecutionData PostJobExecution { get; set; }
+        public TaskRestrictions Restrictions { get; set; }
+    }
+
+    public sealed class DefinitionVersion
+    {
+        public int Major { get; set; }
+        public int Minor { get; set; }
+        public int Patch { get; set; }
     }
 
     public sealed class OutputVariable

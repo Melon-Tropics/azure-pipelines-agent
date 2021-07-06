@@ -15,6 +15,7 @@ using Microsoft.TeamFoundation.DistributedTask.WebApi;
 using Pipelines = Microsoft.TeamFoundation.DistributedTask.Pipelines;
 using Microsoft.VisualStudio.Services.Agent.Util;
 using Microsoft.VisualStudio.Services.Agent.Worker.Handlers;
+using Microsoft.VisualStudio.Services.Agent.Worker.Container;
 
 namespace Microsoft.VisualStudio.Services.Agent.Worker
 {
@@ -75,44 +76,8 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 Definition definition = taskManager.Load(Task);
                 ArgUtil.NotNull(definition, nameof(definition));
 
-                // Verify task signatures if a fingerprint is configured for the Agent.
-                var configurationStore = HostContext.GetService<IConfigurationStore>();
-                AgentSettings settings = configurationStore.GetSettings();
-                SignatureVerificationMode verificationMode = SignatureVerificationMode.None;
-                if (settings.SignatureVerification != null)
-                {
-                    verificationMode = settings.SignatureVerification.Mode;
-                }
-
-                if (verificationMode != SignatureVerificationMode.None)
-                {
-                    ISignatureService signatureService = HostContext.CreateService<ISignatureService>();
-                    Boolean verificationSuccessful =  await signatureService.VerifyAsync(definition, ExecutionContext.CancellationToken);
-
-                    if (verificationSuccessful)
-                    {
-                        ExecutionContext.Output(StringUtil.Loc("TaskSignatureVerificationSucceeeded"));
-
-                        // Only extract if it's not the checkout task.
-                        if (!String.IsNullOrEmpty(definition.ZipPath))
-                        {
-                            taskManager.Extract(ExecutionContext, Task);
-                        }
-                    }
-                    else
-                    {
-                        String message = StringUtil.Loc("TaskSignatureVerificationFailed");
-
-                        if (verificationMode == SignatureVerificationMode.Error)
-                        {
-                            throw new InvalidOperationException(message);
-                        }
-                        else
-                        {
-                            ExecutionContext.Warning(message);
-                        }
-                    }
-                }
+                // Verify Signatures and Re-Extract Tasks if neccessary
+                await VerifyTask(taskManager, definition);
 
                 // Print out task metadata
                 PrintTaskMetaData(definition);
@@ -150,6 +115,28 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 // Setup container stephost and the right runtime variables for running job inside container.
                 if (stepTarget is ContainerInfo containerTarget)
                 {
+                    if (Stage == JobRunStage.PostJob
+                        && AgentKnobs.SkipPostExeceutionIfTargetContainerStopped.GetValue(ExecutionContext).AsBoolean())
+                    {
+                        try
+                        {
+                            // Check that the target container is still running, if not Skip task execution
+                            IDockerCommandManager dockerManager = HostContext.GetService<IDockerCommandManager>();
+                            bool isContainerRunning = await dockerManager.IsContainerRunning(ExecutionContext, containerTarget.ContainerId);
+                            
+                            if (!isContainerRunning)
+                            {
+                                ExecutionContext.Result = TaskResult.Skipped;
+                                ExecutionContext.ResultCode = $"Target container - {containerTarget.ContainerName} has been stopped, task post-execution will be skipped";
+                                return;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            ExecutionContext.Write(WellKnownTags.Warning, $"Failed to check container state for task post-execution. Exception: {ex}");
+                        }
+                    }
+
                     if (handlerData is AgentPluginHandlerData)
                     {
                         // plugin handler always runs on the Host, the runtime variables needs to the variable works on the Host, ex: file path variable System.DefaultWorkingDirectory
@@ -167,7 +154,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                         runtimeVariables = new Variables(HostContext, variableCopy, out expansionWarnings);
                         expansionWarnings?.ForEach(x => ExecutionContext.Warning(x));
                     }
-                    else if (handlerData is NodeHandlerData || handlerData is Node10HandlerData || handlerData is PowerShell3HandlerData)
+                    else if (handlerData is BaseNodeHandlerData || handlerData is PowerShell3HandlerData)
                     {
                         // Only the node, node10, and powershell3 handlers support running inside container.
                         // Make sure required container is already created.
@@ -379,6 +366,56 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
             }
         }
 
+        public async Task VerifyTask(ITaskManager taskManager, Definition definition)
+        {
+            // Verify task signatures if a fingerprint is configured for the Agent.
+            var configurationStore = HostContext.GetService<IConfigurationStore>();
+            AgentSettings settings = configurationStore.GetSettings();
+            SignatureVerificationMode verificationMode = SignatureVerificationMode.None;
+            if (settings.SignatureVerification != null)
+            {
+                verificationMode = settings.SignatureVerification.Mode;
+            }
+
+            if (verificationMode != SignatureVerificationMode.None)
+            {
+                ISignatureService signatureService = HostContext.CreateService<ISignatureService>();
+                Boolean verificationSuccessful = await signatureService.VerifyAsync(definition, ExecutionContext.CancellationToken);
+
+                if (verificationSuccessful)
+                {
+                    ExecutionContext.Output(StringUtil.Loc("TaskSignatureVerificationSucceeeded"));
+
+                    // Only extract if it's not the checkout task.
+                    if (!String.IsNullOrEmpty(definition.ZipPath))
+                    {
+                        taskManager.Extract(ExecutionContext, Task);
+                    }
+                }
+                else
+                {
+                    String message = StringUtil.Loc("TaskSignatureVerificationFailed");
+
+                    if (verificationMode == SignatureVerificationMode.Error)
+                    {
+                        throw new InvalidOperationException(message);
+                    }
+                    else
+                    {
+                        ExecutionContext.Warning(message);
+                    }
+                }
+            }
+            else if (settings.AlwaysExtractTask)
+            {
+                // Only extract if it's not the checkout task.
+                if (!String.IsNullOrEmpty(definition.ZipPath))
+                {
+                    taskManager.Extract(ExecutionContext, Task);
+                }
+            }
+        }
+
         public HandlerData GetHandlerData(IExecutionContext ExecutionContext, ExecutionData currentExecution, PlatformUtil.OS hostOS)
         {
             ArgUtil.NotNull(ExecutionContext, nameof(ExecutionContext));
@@ -406,7 +443,7 @@ namespace Microsoft.VisualStudio.Services.Agent.Worker
                 if (stepTarget is ContainerInfo)
                 {
                     if ((currentExecution.All.Any(x => x is PowerShell3HandlerData)) &&
-                        (currentExecution.All.Any(x => x is NodeHandlerData || x is Node10HandlerData)))
+                        (currentExecution.All.Any(x => x is BaseNodeHandlerData)))
                         {
                             Trace.Info($"Since we are targeting a container, we will prefer a node handler if one is available");
                             preferPowershellHandler = false;
